@@ -1,0 +1,20 @@
+*images
+*csv
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+__pycache__/
+*.pyc
+
+# VS Code settings
+.vscode/
+
+# Python / env
+.env
+*.egg-info/
+dist/
+build/
+
+# OS files
+.DS_Store
+Thumbs.db
