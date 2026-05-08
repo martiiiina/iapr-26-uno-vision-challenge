@@ -140,7 +140,7 @@ def print_ranges(samples: dict):
                 print(f'    "{c}": [({h_lo}, {s_lo}, {v_lo}), ({h_hi}, 255, 255)],')
 
 
-def plot_hsv_histograms(images_bgr, titles, samples: dict):
+def plot_hsv_histograms(images_bgr, titles, samples=None):
     """H, S, V histograms per image with sampled points overlaid as vertical lines."""
     n = len(images_bgr)
     _, axes = plt.subplots(4, n, figsize=(5 * n, 14))
@@ -188,10 +188,11 @@ def plot_hsv_histograms(images_bgr, titles, samples: dict):
                                    label=LABEL[color_name])
 
             # Overlay sampled values as vertical lines
-            for c, pts in samples.items():
-                for (h, s, v) in pts:
-                    val = {1: h, 2: s, 3: v}[row]
-                    ax.axvline(val, color=mpl_color[c], alpha=0.7, linewidth=1.2)
+            if samples is not None:
+                for c, pts in samples.items():
+                    for (h, s, v) in pts:
+                        val = {1: h, 2: s, 3: v}[row]
+                        ax.axvline(val, color=mpl_color[c], alpha=0.7, linewidth=1.2)
 
             if row == 1:
                 handles, labels = ax.get_legend_handles_labels()
