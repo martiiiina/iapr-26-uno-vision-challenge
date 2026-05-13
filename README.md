@@ -36,11 +36,14 @@ Image
   │
   ▼
 3. Turn Token Detection       — separate the token from card regions;
-                                determine active player side (top/bottom/left/right)
+                                determine active player side (top/bottom/left/right);
+                                zero out any card region overlapping the token box
   │
   ▼
-4. Card Location Assignment   — merge nearby color blobs → bounding boxes;
-   (3×3 grid)                   map each box to a table position
+4. Card Region Filtering      — direction-aware merge of nearby blobs → bounding boxes;
+   (merge + size + dedup)       discard boxes below MIN_CARD_AREA;
+                                remove one of the two symmetric halves each UNO card
+                                produces (split by the white oval)
   │
   ▼
 5. Corner Patch Extraction    — find the best 90° corner on each card region;
@@ -67,26 +70,38 @@ Background type detection distinguishes **noisy** (yellow-green textured) from *
 
 ### Step 2 — Region Filtering
 
-Connected components smaller than `MIN_REGION_SIZE` are dropped. Surviving regions are tested for card-like shape: morphological closing + hole removal → Douglas-Peucker polygon → check for at least one ~90° vertex. Circular regions (circularity ≥ 0.8) are kept as turn-token candidates.
+Connected components smaller than `MIN_REGION_SIZE` are dropped. Surviving regions are tested for card-like shape: morphological closing + hole removal → Douglas-Peucker polygon → check for at least one ~90° vertex (`CORNER_TOL`). Circular regions (circularity ≥ 0.8) are kept as turn-token candidates.
 
 ### Step 3 — Turn Token Detection
 
 - **Noisy background**: the yellow region with the highest circularity score is the token.
 - **Clean background**: morphological closing then opening on all black regions isolates the compact token disk (largest surviving component).
 
-The token centroid is mapped to the nearest table edge (top/bottom/left/right) to identify the active player.
+The token centroid is mapped to the nearest table edge (top/bottom/left/right) to identify the active player. After detection, any card region whose bounding box overlaps the token bounding box is zeroed out to prevent double-counting.
 
-### Step 4 — Card Location Assignment
+### Step 4 — Card Region Filtering
 
-Color blobs belonging to the same physical card are merged by iteratively unioning bounding boxes within `MERGE_DISTANCE` pixels. Merged boxes below `MIN_CARD_AREA` are discarded. Each surviving box is assigned a location (`top`, `bottom`, `left`, `right`, `center`) via a 3×3 grid.
+Three sub-steps clean up the segmented card regions:
+
+1. **Direction-aware merge** (`merge_nearby_boxes_oriented`, distance = 60 px): bounding boxes are merged if their gap is within the threshold, using only the horizontal gap for left/right players and only the vertical gap for top/bottom players. This ensures all visible portions of a card in the same row/column merge into one box even when inter-card spacing is small.
+
+2. **Size filter** (`MIN_CARD_AREA`): merged boxes smaller than the threshold are discarded as noise.
+
+3. **Symmetric region deduplication**: UNO cards are segmented into two colored halves split by the central white oval. For each color region, if another region of the same color (or any color for the center cell) in the same grid cell has a bounding-box center within `PROXIMITY_THRESH` pixels in the relevant axis, only the larger region (by pixel count) is kept. The relevant axis is:
+   - **X proximity** for Players 1 & 3 (top/bottom) — the two halves share the same horizontal position
+   - **Y proximity** for Players 2 & 4 (left/right) — the two halves share the same vertical position
+   - **Any axis** for the center cell — only the single largest region is kept
+   - **Black (wild) cards** skip the same-color constraint and remove all smaller same-cell regions
 
 ### Step 5 — Corner Patch Extraction
 
-For each card region the best 90° polygon vertex (longest combined adjacent edges) is found. The image is rotated so that the card edge is horizontal, then a `PATCH_SIZE × PATCH_SIZE` crop is extracted from the corner, inset by `CORNER_MARGIN` pixels so the card border is flush with the patch boundary.
+For each card region the best 90° polygon vertex (longest combined adjacent edges, within `CORNER_TOL` degrees of 90°) is found. The image is rotated so that the card edge is horizontal, then a `PATCH_SIZE × PATCH_SIZE` crop is extracted from the corner, inset by `CORNER_MARGIN` pixels so the card border is flush with the patch boundary.
+
+The card's centroid (pixel mean) is used for grid-cell location assignment rather than the corner position, which can point toward the table centre.
 
 ### Step 6 — Number Classification (Template Matching)
 
-Reference patches are created manually from `reference_images/` using an interactive widget (`CREATE_TEMPLATE_PATCHES = True`). At inference time each extracted patch is matched against all templates using `cv2.matchTemplate` (TM_CCOEFF_NORMED), trying all four 90° rotations. The label with the highest score above `MATCH_THRESHOLD` is assigned; otherwise the card is marked `"?"`.
+Reference patches are created manually from `reference_images/` using an interactive widget (`CREATE_TEMPLATE_PATCHES = True`). At inference time each extracted patch is matched against all templates using `cv2.matchTemplate` (TM_CCOEFF_NORMED), trying all four 90° rotations. The label with the highest score is assigned.
 
 ---
 
@@ -113,17 +128,18 @@ Reference patches are created manually from `reference_images/` using an interac
 
 ## Key Hyperparameters
 
-| Parameter | Default | Effect |
-|-----------|---------|--------|
+| Parameter | Value | Effect |
+|-----------|-------|--------|
 | `MIN_SATURATION` | 90 | Discard low-saturation (background) pixels |
 | `MIN_VALUE` | 40 | Discard very dark pixels |
-| `MIN_REGION_SIZE` | 8000 px | Drop small noise regions after segmentation |
-| `MERGE_DISTANCE` | 30 px | Max gap between boxes to merge into one card |
-| `MIN_CARD_AREA` | 250 000 px² | Minimum bounding-box area to count as a card |
-| `PATCH_SIZE` | 120 px | Side length of extracted corner patch |
-| `CORNER_MARGIN` | 20 px | Inset so card border is flush with patch edge |
+| `MIN_REGION_SIZE` | 8 000 px | Drop small noise regions after segmentation |
+| `MIN_CARD_AREA` | 150 000 px² | Minimum merged-box area to count as a card |
+| `CLOSING_DISK` | 3 | Morphological closing disk for corner extraction |
 | `EPSILON_FACTOR` | 0.05 | Douglas-Peucker tolerance for polygon simplification |
-| `MATCH_THRESHOLD` | 0.5 | Minimum template-match score to assign a label |
+| `PATCH_SIZE` | 90 px | Side length of extracted corner patch |
+| `CORNER_TOL` | 15° | Max deviation from 90° to accept a polygon vertex as a corner |
+| `CORNER_MARGIN` | 5 px | Inset so card border is flush with patch edge |
+| `PROXIMITY_THRESH` | 300 px | Max bbox-center distance to treat two regions as the same card |
 
 ---
 
@@ -135,21 +151,6 @@ image_id,center_card,active_player,player_1_cards,player_2_cards,player_3_cards,
 
 - `center_card`: e.g. `r_5`, `b_skip`, `wild`
 - `active_player`: `p1` / `p2` / `p3` / `p4`
-- `player_N_cards`: space-separated list of card labels, e.g. `r_3 g_7 b_skip`
+- `player_N_cards`: semicolon-separated list of card labels, e.g. `r_3;g_7;b_skip`
 
 Card labels follow the format `{color}_{value}` where color ∈ {r, y, g, b} and value ∈ {0–9, skip, reverse, draw_2, wild, draw_4}.
-
----
-
-## Status
-
-| Stage | Status |
-|-------|--------|
-| Data loading | Done |
-| HSV segmentation | Done |
-| Corner-based region filtering | Done |
-| Turn token detection | Done |
-| Card location assignment (3×3 grid) | Done |
-| Corner patch extraction | Done |
-| Template matching classifier | Ready to run |
-| End-to-end inference pipeline | In progress |
