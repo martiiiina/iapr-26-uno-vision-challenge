@@ -288,3 +288,185 @@ def filter_cards_by_corners(labels, params, disk_size=5, epsilon_factor=0.02,
 
     return filtered_labels, filtered_boxes
 
+### TURN TOKEN DETECTION
+
+def _nearest_player(cx, cy, img_shape):
+    """Return the nearest player side ('top'/'bottom'/'left'/'right') to point (cx, cy)."""
+    H, W = img_shape[:2]
+    centers = {
+        "top":    (W / 2,     H / 6),
+        "bottom": (W / 2,     H * 5 / 6),
+        "left":   (W / 6,     H / 2),
+        "right":  (W * 5 / 6, H / 2),
+    }
+    return min(centers, key=lambda s: (cx - centers[s][0])**2 + (cy - centers[s][1])**2)
+
+
+def _region_circularity(region_mask, params):
+    """Return circularity = 4π·area/perimeter² after a small closing to smooth the boundary."""
+    closed  = apply_closing(region_mask, params["TOKEN_CLOSING_DISK"])
+    mask_u8 = closed.astype(np.uint8) * 255
+    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return 0.0
+    c = max(contours, key=cv2.contourArea)
+    a = cv2.contourArea(c)
+    p = cv2.arcLength(c, True)
+    return 4 * np.pi * a / p**2 if p > 0 else 0.0
+
+
+def _token_result(region_mask, color_name, filtered_labels, filtered_boxes, img_shape, params):
+    """Package a confirmed token region into the standard return tuple."""
+    ys, xs = np.where(region_mask)
+    cx, cy = float(xs.mean()), float(ys.mean())
+    x1, y1 = int(xs.min()), int(ys.min())
+    w = int(xs.max() - xs.min() + 1)
+    h = int(ys.max() - ys.min() + 1)
+    token_box      = (x1, y1, w, h, color_name)
+    token_location = _nearest_player(cx, cy, img_shape)
+    card_labels    = filtered_labels.copy()
+    card_labels[region_mask] = 0
+    # Remove same-color fragments whose bounding box overlaps the token box
+    # (handles cases where the token is fragmented into multiple connected components)
+    clbl = params["COLOR_NAMES"].index(color_name) + 1
+    cc_tok, n_tok = ndimage.label(card_labels == clbl)
+    for rid in range(1, n_tok + 1):
+        frag = cc_tok == rid
+        ys_f, xs_f = np.where(frag)
+        if (int(xs_f.min()) < x1 + w and int(xs_f.max()) > x1 and
+                int(ys_f.min()) < y1 + h and int(ys_f.max()) > y1):
+            card_labels[frag] = 0
+    card_boxes = [b for b in filtered_boxes
+                  if not (b[4] == color_name
+                          and b[0] < x1 + w and b[0] + b[2] > x1
+                          and b[1] < y1 + h and b[1] + b[3] > y1)]
+    return token_box, token_location, card_labels, card_boxes
+
+
+def _black_token_morph(filtered_labels, params):
+    """
+    Isolate the black token from all black regions using closing then opening.
+
+    Closing merges nearby black fragments; opening then removes thin/small
+    regions (card borders, numbers), leaving only compact solid objects.
+    Returns the largest surviving connected component — the token.
+
+    Also returns intermediate masks for visualization.
+    """
+    clbl       = params["COLOR_NAMES"].index("black") + 1
+    black_mask = (filtered_labels == clbl)
+    closed     = apply_closing(black_mask, params["TOKEN_MORPH_DISK"])
+    opened     = apply_opening(closed,     params["TOKEN_MORPH_DISK"])
+
+    cc, n_regions = ndimage.label(opened)
+    if n_regions == 0:
+        return None, black_mask, closed, opened
+
+    sizes   = np.bincount(cc.ravel()); sizes[0] = 0
+    best_id = int(sizes.argmax())
+    return (cc == best_id), black_mask, closed, opened
+
+
+def visualize_black_token_morph(img_rgb, black_mask, closed, opened, token_mask, params):
+    """4-panel: raw black regions → after closing → after opening → selected token."""
+    steps = [
+        (black_mask, "Black regions (raw)"),
+        (closed,     f"After closing  (disk={params['TOKEN_MORPH_DISK']})"),
+        (opened,     f"After opening  (disk={params['TOKEN_MORPH_DISK']})"),
+        (token_mask, "Selected token  (largest region)"),
+    ]
+    fig, axes = plt.subplots(1, 4, figsize=(22, 5))
+    for ax, (mask, title) in zip(axes, steps):
+        ax.imshow(img_rgb)
+        if mask is not None:
+            overlay = np.zeros((*img_rgb.shape[:2], 4), dtype=np.uint8)
+            overlay[mask] = [255, 220, 0, 160]      # Overlays a yellow mask if the token is found
+            ax.imshow(overlay)
+        ax.set_title(title, fontsize=9)
+        ax.axis("off")
+    plt.suptitle("Black token isolation — closing + opening", fontsize=11)
+    plt.tight_layout()
+    plt.show()
+
+
+def detect_token(filtered_labels, filtered_boxes, img_shape, params, noisy=False, visualize_morph=False):
+    """
+    Find the turn token among filtered regions and return it separately.
+
+    Strategy depends on background type:
+      - noisy background : yellow region with the highest circularity (round disk)
+      - clean background : apply closing+opening to all black regions, pick the largest
+
+    Returns
+    -------
+    token_box      : (x, y, w, h, color) or None
+    token_location : 'top'|'bottom'|'left'|'right' or None
+    card_labels    : filtered_labels with the token region zeroed out
+    card_boxes     : filtered_boxes with the token entry removed
+    """
+    if noisy:
+        best_circ, best_mask = -1.0, None
+        clbl = params["COLOR_NAMES"].index("yellow") + 1
+        cc, n_regions = ndimage.label(filtered_labels == clbl)
+        for region_id in range(1, n_regions + 1):
+            region_mask = (cc == region_id)
+            circ = _region_circularity(region_mask, params)
+            if circ > best_circ:
+                best_circ, best_mask = circ, region_mask
+        if best_mask is not None:
+            closed_mask = apply_closing(best_mask, params["TOKEN_CLOSING_DISK"])
+            return _token_result(closed_mask, "yellow", filtered_labels, filtered_boxes, img_shape, params)
+
+    else:
+        token_mask, black_mask, closed, opened = _black_token_morph(filtered_labels, params)
+        if visualize_morph:
+            visualize_black_token_morph(
+                np.zeros((*filtered_labels.shape, 3), dtype=np.uint8),  # placeholder — pass img_rgb at call site
+                black_mask, closed, opened, token_mask, params)
+        if token_mask is not None:
+            return _token_result(token_mask, "black", filtered_labels, filtered_boxes, img_shape, params)
+
+    return None, None, filtered_labels, list(filtered_boxes)
+
+
+def visualize_token(img_rgb, token_box, token_location, params):
+    """Show the image with the 3x3 grid, token bounding box, and player arrow."""
+    H, W = img_rgb.shape[:2]
+    player_centers = {
+        "top":    (W / 2,     H / 6),
+        "bottom": (W / 2,     H * 5 / 6),
+        "left":   (W / 6,     H / 2),
+        "right":  (W * 5 / 6, H / 2),
+    }
+
+    fig, ax = plt.subplots(figsize=(14, 8))
+    ax.imshow(img_rgb); ax.axis("off")
+
+    for frac in [1/3, 2/3]:
+        ax.axvline(W * frac, color="white", linewidth=1, linestyle="--", alpha=0.5)
+        ax.axhline(H * frac, color="white", linewidth=1, linestyle="--", alpha=0.5)
+
+    if token_box is not None:
+        x, y, w, h, color_name = token_box
+        ec = params["EDGE_COLORS"].get(color_name, "white")
+        ax.add_patch(plt.Rectangle((x, y), w, h, lw=3, edgecolor=ec, facecolor="none"))
+        ax.text(x + w / 2, y + h / 2, f"token\n({color_name})", color="white",
+                fontsize=9, fontweight="bold", ha="center", va="center",
+                bbox=dict(boxstyle="round,pad=0.3", fc="black", alpha=0.6))
+
+        if token_location in player_centers:
+            tx, ty = x + w / 2, y + h / 2
+            px, py = player_centers[token_location]
+            ax.annotate("", xy=(px, py), xytext=(tx, ty),
+                        arrowprops=dict(arrowstyle="->", color="black", lw=2))
+            ax.text(px, py, token_location, color="white", fontsize=11, fontweight="bold",
+                    ha="center", va="center",
+                    bbox=dict(boxstyle="round,pad=0.4", fc="black", alpha=0.6))
+    else:
+        ax.set_title("No token detected")
+
+    ax.set_title(f"Token detection — location: {token_location}")
+    plt.tight_layout()
+    plt.show()
+
+
