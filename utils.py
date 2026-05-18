@@ -1224,7 +1224,7 @@ def build_template_distance_maps(templates: dict, min_v: int = None, max_s: int 
             for label, tmpl in templates.items()}
 
 def match_patch_distance(patch_rgb: np.ndarray, card_color: str,
-                         template_dmaps: dict, shift_step: int = None, black_only: int = None,
+                         template_dmaps: dict, shift_step: int = None, black_only=None,
                          min_v: int = None, max_s: int = None, border: int = None, 
                          open_disk: int = None, min_size: int = None) -> tuple:
     """
@@ -1275,7 +1275,7 @@ def match_patch_distance(patch_rgb: np.ndarray, card_color: str,
     return best_label, best_dist
 
 
-def classify_all_patches_distance(results: list, template_dmaps: dict, shift_step: int = None, black_only: int = None,
+def classify_all_patches_distance(results: list, template_dmaps: dict, shift_step: int = None, black_only=None,
                                   min_v: int = None, max_s: int = None, border: int = None, open_disk: int = None, 
                                   min_size: int = None) -> list:
     """
@@ -1329,7 +1329,7 @@ def visualize_template_dmaps(templates: dict, template_dmaps: dict, template_sym
     plt.tight_layout()
     plt.show()
 
-def visualize_patch_matching(results: list, template_dmaps: dict, top_k: int = 5, shift_step: int = None, black_only: int = None,
+def visualize_patch_matching(results: list, template_dmaps: dict, top_k: int = 5, shift_step: int = None, black_only = None,
                              min_v: int = None, max_s: int = None, border: int = None, open_disk: int = None, min_size: int = None):
     """
     For every extracted patch show:
