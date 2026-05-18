@@ -1378,13 +1378,13 @@ def _to_card_label(tmpl_label, color, params):
 
 
 def classify_image(img_rgb, tmpl_dmaps, params):
-    noisy  = _is_noisy_background(img_rgb)
+    noisy  = _is_noisy_background(img_rgb, params=params)
     H, W   = img_rgb.shape[:2]
 
-    labels, _          = segment(img_rgb, min_region_size=params["MIN_REGION_SIZE"])
+    labels, _          = segment(img_rgb, min_region_size=params["MIN_REGION_SIZE"], params=params)
     f_labels, f_boxes  = filter_cards_by_corners(labels, params)
     token_box, token_loc, card_labels, card_boxes = detect_token(
-        f_labels, f_boxes, img_rgb.shape, noisy=noisy)
+        f_labels, f_boxes, img_rgb.shape, params=params, noisy=noisy)
 
     merged_boxes = merge_nearby_boxes(card_boxes, params["MERGE_DISTANCE"])
     valid_boxes  = filter_by_size(merged_boxes, params["MIN_CARD_AREA"])
@@ -1396,8 +1396,17 @@ def classify_image(img_rgb, tmpl_dmaps, params):
                   closing_disk=params["CLOSING_DISK"], epsilon_factor=params["EPSILON_FACTOR"],
                   patch_size=params["PATCH_SIZE"], proximity_thresh=params["PROXIMITY_THRESH"],
                   angle_tol=params["CORNER_TOL"], corner_margin=params["CORNER_MARGIN"])
-    preds   = classify_all_patches_distance(patches, tmpl_dmaps, params["SHIFT_STEP"])
-
+    preds = classify_all_patches_distance(
+        patches, tmpl_dmaps,
+        shift_step=params["SHIFT_STEP"],
+        black_only=params["_BLACK_ONLY"],          # must be passed in or added to params
+        min_v=params["SYMBOL_MIN_V"],
+        max_s=params["SYMBOL_MAX_S"],
+        border=params["SYMBOL_BORDER"],
+        open_disk=params["SYMBOL_OPEN_DISK"],
+        min_size=params["SIZE_TO_REMOVE"]
+    )
+    
     # Zone anchors: midpoint of each player edge + image centre
     anchors = {
         'center': (W / 2, H / 2),
