@@ -116,21 +116,6 @@ player_4 (left)  ·  player_2 (right)
 
 ---
 
-## Known Bugs (to fix before the next run)
-
-Six bugs were identified after the latest performance regression.  
-See [`BUGS.md`](BUGS.md) for details and exact fixes.  
-Short summary:
-
-1. `classify_image` — `_is_noisy_background` called without `params` → `TypeError` on every image.
-2. `classify_image` — `segment` called without `params` → `TypeError`.
-3. `classify_image` — `detect_token` called without `params`; `noisy` silently bound to wrong arg.
-4. `classify_image` — `classify_all_patches_distance` only receives `shift_step`; `black_only` and symbol-segmentation params are `None` → wrong template set used for black cards.
-5. `compute_distance_map` — forward pass starts at row 1 / col 1, leaving the first row and column unpropagated → corrupted distance maps for symbols near patch edges.
-6. Data loading — `"train"` substring check matches `train_masks/` paths, polluting `images_train`; `reference_images` routing also unreliable.
-
----
-
 ## Dependencies
 
 ```

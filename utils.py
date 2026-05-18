@@ -266,10 +266,15 @@ def visualize_corner_detection(region_mask, disk_size=5, epsilon_factor=0.02,
 
 
 def filter_cards_by_corners(labels, params, disk_size=5, epsilon_factor=0.02,
-                             angle_tolerance=10, hole_size=500, circularity_threshold=0.8):
+                             angle_tolerance=10, hole_size=500, circularity_threshold=0.8, 
+                             min_solidity=0.5, min_area=4000):
     """
     Keep regions that have a ~90° corner (card) OR are approximately circular (turn token).
     Removes everything else (leaves, noise).
+    Added guards vs. the original:
+    - min_area     : skip tiny fragments before any geometry is computed
+    - min_solidity : area / convex_hull_area — cards are compact (≥0.6),
+                    thin spiky leaves are not (typically 0.2–0.45)
     """
     filtered_labels = labels.copy()
     filtered_boxes  = []
@@ -279,6 +284,26 @@ def filter_cards_by_corners(labels, params, disk_size=5, epsilon_factor=0.02,
 
         for region_id in range(1, n_regions + 1):
             region_mask = (cc == region_id)
+
+            # --- fast reject: too small to be a card ---
+            if region_mask.sum() < min_area:
+                filtered_labels[region_mask] = 0
+                continue
+            
+            # --- solidity check: discard spiky/thin shapes ---
+            crop = _crop_region(region_mask, pad=disk_size + 2)
+            _, mask_closed = _polygon_from_mask(crop, disk_size, epsilon_factor, hole_size)
+            mask_u8 = mask_closed.astype(np.uint8) * 255
+            contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                contour  = max(contours, key=cv2.contourArea)
+                area     = cv2.contourArea(contour)
+                hull     = cv2.convexHull(contour)
+                hull_area = cv2.contourArea(hull)
+                solidity = area / hull_area if hull_area > 0 else 0.0
+                if solidity < min_solidity:
+                    filtered_labels[region_mask] = 0
+                    continue
 
             if has_right_angle_corner(region_mask, disk_size, epsilon_factor,
                                       angle_tolerance, hole_size, circularity_threshold):
@@ -351,13 +376,9 @@ def _token_result(region_mask, color_name, filtered_labels, filtered_boxes, img_
 
 def _black_token_morph(filtered_labels, params):
     """
-    Isolate the black token from all black regions using closing then opening.
-
-    Closing merges nearby black fragments; opening then removes thin/small
-    regions (card borders, numbers), leaving only compact solid objects.
-    Returns the largest surviving connected component — the token.
-
-    Also returns intermediate masks for visualization.
+    Isolate the black token using closing then opening, then pick the
+    most compact region (closest to square) rather than the largest.
+    A wild card's black border is large but irregular; the token is small and compact.
     """
     clbl       = params["COLOR_NAMES"].index("black") + 1
     black_mask = (filtered_labels == clbl)
@@ -368,10 +389,32 @@ def _black_token_morph(filtered_labels, params):
     if n_regions == 0:
         return None, black_mask, closed, opened
 
-    sizes   = np.bincount(cc.ravel()); sizes[0] = 0
-    best_id = int(sizes.argmax())
-    return (cc == best_id), black_mask, closed, opened
+    # Score each region by compactness = min(w,h)/max(w,h)
+    # A square token scores ~1.0; a thin card border scores much lower
+    best_id, best_score = None, -1
+    sizes = np.bincount(cc.ravel()); sizes[0] = 0
 
+    for rid in range(1, n_regions + 1):
+        if sizes[rid] == 0:
+            continue
+        region = cc == rid
+        ys, xs = np.where(region)
+        w = int(xs.max() - xs.min() + 1)
+        h = int(ys.max() - ys.min() + 1)
+        area = sizes[rid]
+
+        # Compactness: how square is the bounding box
+        aspect = min(w, h) / max(w, h) if max(w, h) > 0 else 0
+
+        # Solidity: area vs bounding box area (filled rectangle = 1.0)
+        solidity = area / (w * h) if w * h > 0 else 0
+
+        # Combined score: we want compact AND solid
+        score = aspect * solidity
+        if score > best_score:
+            best_score, best_id = score, rid
+
+    return (cc == best_id), black_mask, closed, opened
 
 def visualize_black_token_morph(img_rgb, black_mask, closed, opened, token_mask, params):
     """4-panel: raw black regions → after closing → after opening → selected token."""
@@ -497,36 +540,62 @@ def merge_nearby_boxes(boxes, merge_distance):
     """
     Greedily merge bounding boxes within merge_distance pixels of each other.
     Repeats until stable. Returns list of (x, y, w, h).
+    Merge bounding boxes within merge_distance pixels of each other.
+    Uses union-find so the result is order-independent: if A is close to B
+    and B is close to C, all three merge even if A and C are far apart.
+    Returns list of (x, y, w, h).
     """
     rects = [b[:4] for b in boxes]
-    changed = True
-    while changed:
-        changed = False
-        merged = []; used = [False] * len(rects)
-        for i in range(len(rects)):
-            if used[i]:
-                continue
-            current = rects[i]
-            for j in range(i + 1, len(rects)):
-                if used[j]:
-                    continue
-                if _box_gap(current, rects[j]) <= merge_distance:
-                    current = _union_box(current, rects[j])
-                    used[j] = True
-                    changed = True
-            merged.append(current)
-            used[i] = True
-        rects = merged
-    return rects
+    n = len(rects)
+    if n == 0:
+        return []
+    
+    # union-find with path compression 
+    parent = list(range(n))
 
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]  # path compression
+            i = parent[i]
+        return i
+
+    def union(i, j):
+        parent[find(i)] = find(j)
+
+    # Mark every pair that should merge
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _box_gap(rects[i], rects[j]) <= merge_distance:
+                union(i, j)
+
+    # Group boxes by their root
+    groups = {}
+    for i in range(n):
+        root = find(i)
+        groups.setdefault(root, []).append(i)
+
+    # Compute the union box for each group
+    merged = []
+    for indices in groups.values():
+        current = rects[indices[0]]
+        for i in indices[1:]:
+            current = _union_box(current, rects[i])
+        merged.append(current)
+
+    return merged
+
+
+    
 def _filter_labels_by_boxes(card_labels, valid_boxes, params, noisy=False):
     """For noisy images, zero out label regions whose centroid is closer to an
     image border than any valid-box centroid is to that same border.
     Clean images are returned unchanged."""
     if not noisy or not valid_boxes:
         return card_labels.copy()
+    # Compute valid boxes centroids 
     vcxs = [vx + vw / 2 for vx, vy, vw, vh in valid_boxes]
     vcys = [vy + vh / 2 for vx, vy, vw, vh in valid_boxes]
+
     min_cx, max_cx = min(vcxs), max(vcxs)
     min_cy, max_cy = min(vcys), max(vcys)
     result = card_labels.copy()
@@ -1392,7 +1461,7 @@ def classify_image(img_rgb, tmpl_dmaps, params):
 
     active  = params["_LOC_TO_PLAYER"].get(token_loc, 'EMPTY')
     patches = extract_corner_patches(
-                  img_rgb, card_labels,
+                  img_rgb, card_labels, params=params,
                   closing_disk=params["CLOSING_DISK"], epsilon_factor=params["EPSILON_FACTOR"],
                   patch_size=params["PATCH_SIZE"], proximity_thresh=params["PROXIMITY_THRESH"],
                   angle_tol=params["CORNER_TOL"], corner_margin=params["CORNER_MARGIN"])
