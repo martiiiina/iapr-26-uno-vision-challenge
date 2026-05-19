@@ -455,17 +455,42 @@ def detect_token(filtered_labels, filtered_boxes, img_shape, params, noisy=False
     """
     if noisy:
         best_circ, best_mask = -1.0, None
+        fallback_score, fallback_mask = -1.0, None
         clbl = params["COLOR_NAMES"].index("yellow") + 1
         cc, n_regions = ndimage.label(filtered_labels == clbl)
+
         for region_id in range(1, n_regions + 1):
             region_mask = (cc == region_id)
+            ys, xs = np.where(region_mask)
+            w = int(xs.max() - xs.min() + 1)
+            h = int(ys.max() - ys.min() + 1)
+            aspect = min(w, h) / max(w, h) if max(w, h) > 0 else 0
+            area = int(region_mask.sum())
             circ = _region_circularity(region_mask, params)
+
+            # Fallback: always track best circ*aspect in case strict filter finds nothing
+            score = circ * aspect
+            if score > fallback_score:
+                fallback_score, fallback_mask = score, region_mask
+
+            # Strict filter
+            if aspect < params.get("TOKEN_MIN_ASPECT", 0.90):
+                continue
+            if not (params.get("TOKEN_MIN_AREA", 15000) <= area <= params.get("TOKEN_MAX_AREA", 28500)):
+                continue
+            if circ < params.get("TOKEN_MIN_CIRC", 0.55):
+                continue
+
             if circ > best_circ:
                 best_circ, best_mask = circ, region_mask
-        if best_mask is not None:
-            closed_mask = apply_closing(best_mask, params["TOKEN_CLOSING_DISK"])
-            return _token_result(closed_mask, "yellow", filtered_labels, filtered_boxes, img_shape, params)
 
+        # Use strict result if found, otherwise fall back
+        chosen_mask = best_mask if best_mask is not None else fallback_mask
+
+        if chosen_mask is not None:
+            closed_mask = apply_closing(chosen_mask, params["TOKEN_CLOSING_DISK"])
+            return _token_result(closed_mask, "yellow", filtered_labels,
+                                filtered_boxes, img_shape, params)
     else:
         token_mask, black_mask, closed, opened = _black_token_morph(filtered_labels, params)
         if visualize_morph:
@@ -1441,23 +1466,38 @@ def _to_card_label(tmpl_label, color, params):
     if tmpl_label not in params["_TMPL_TO_VALUE"]:
         return None
     value = params["_TMPL_TO_VALUE"][tmpl_label]
-    if value is None:
-        return 'draw_4' if tmpl_label == 'template_plus4' else 'wild'
-    return f"{params['_COLOR_ABBREV'].get(color, color)}_{value}"
+    # Wild/draw4 have no colour prefix
+    if tmpl_label in params["_BLACK_ONLY"]:
+        return value
+    abbrev = params["_COLOR_ABBREV"].get(color)
+    if abbrev is None:
+        return None
+    return f"{abbrev}_{value}"
 
 
 def classify_image(img_rgb, tmpl_dmaps, params):
-    noisy  = _is_noisy_background(img_rgb, params=params)
-    H, W   = img_rgb.shape[:2]
+    noisy = _is_noisy_background(img_rgb, params=params)
+    H, W  = img_rgb.shape[:2]
 
-    labels, _          = segment(img_rgb, min_region_size=params["MIN_REGION_SIZE"], params=params)
-    f_labels, f_boxes  = filter_cards_by_corners(labels, params)
-    token_box, token_loc, card_labels, card_boxes = detect_token(
-        f_labels, f_boxes, img_rgb.shape, params=params, noisy=noisy)
+    # 1. Segment
+    labels, boxes = segment(img_rgb, min_region_size=params["MIN_REGION_SIZE"], params=params)
 
-    merged_boxes = merge_nearby_boxes(card_boxes, params["MERGE_DISTANCE"])
-    valid_boxes  = filter_by_size(merged_boxes, params["MIN_CARD_AREA"])
-    card_labels  = _filter_labels_by_boxes(card_labels, valid_boxes, params, noisy=noisy)
+    # 2. Token detection on raw labels FIRST
+    token_box, token_loc, labels_no_token, boxes_no_token = detect_token(
+        labels, boxes, img_rgb.shape, params=params, noisy=noisy)
+
+    # 3. Filter cards on token-removed labels
+    f_labels, f_boxes = filter_cards_by_corners(
+        labels_no_token, params,
+        min_solidity=params.get("MIN_SOLIDITY", 0.5),
+        min_area=params.get("MIN_AREA_FILTER", 4000))
+
+    # 4. Size filter + merge
+    max_card_area = params.get("MAX_CARD_AREA", int(H * W * 0.15))
+    size_filtered = [b for b in f_boxes
+                     if params["MIN_CARD_AREA"] <= b[2]*b[3] <= max_card_area]
+    merged_boxes  = merge_nearby_boxes(size_filtered, params["MERGE_DISTANCE"])
+    card_labels   = _filter_labels_by_boxes(f_labels, merged_boxes, params, noisy=noisy)
 
     active  = params["_LOC_TO_PLAYER"].get(token_loc, 'EMPTY')
     patches = extract_corner_patches(
@@ -1468,15 +1508,13 @@ def classify_image(img_rgb, tmpl_dmaps, params):
     preds = classify_all_patches_distance(
         patches, tmpl_dmaps,
         shift_step=params["SHIFT_STEP"],
-        black_only=params["_BLACK_ONLY"],          # must be passed in or added to params
+        black_only=params["_BLACK_ONLY"],
         min_v=params["SYMBOL_MIN_V"],
         max_s=params["SYMBOL_MAX_S"],
         border=params["SYMBOL_BORDER"],
         open_disk=params["SYMBOL_OPEN_DISK"],
-        min_size=params["SIZE_TO_REMOVE"]
-    )
-    
-    # Zone anchors: midpoint of each player edge + image centre
+        min_size=params["SIZE_TO_REMOVE"])
+
     anchors = {
         'center': (W / 2, H / 2),
         'top'   : (W / 2, 0),
